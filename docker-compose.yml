@@ -1,0 +1,131 @@
+name: firmwareguard
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: firmwareguard-postgres
+    environment:
+      POSTGRES_USER: firmwareguard
+      POSTGRES_PASSWORD: firmwareguard
+      POSTGRES_DB: firmwareguard
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U firmwareguard"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: firmwareguard-redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      additional_contexts:
+        kernels: ./emulation/kernels
+      args:
+        DOCKER_GID: "${DOCKER_GID:-999}"
+    image: firmwareguard-backend
+    container_name: firmwareguard-backend-1
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://firmwareguard:firmwareguard@postgres:5432/firmwareguard
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_ROOT: /data/firmware
+      GHIDRA_INSTALL_DIR: /opt/ghidra
+      GHIDRA_SCRIPTS_PATH: /opt/ghidra_scripts
+      EMULATION_IMAGE: firmwareguard-emulation
+      EMULATION_NETWORK: firmwareguard_emulation_net
+      FUZZING_IMAGE: firmwareguard-fuzzing
+      UART_BRIDGE_HOST: host.docker.internal
+      UART_BRIDGE_PORT: "9999"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - firmware_data:/data/firmware
+      - ./ghidra/scripts:/opt/ghidra_scripts:ro
+      - ./emulation/kernels:/opt/kernels:rw
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  emulation:
+    build:
+      context: ./emulation
+      dockerfile: Dockerfile
+    image: firmwareguard-emulation
+    volumes:
+      - firmware_data:/data/firmware:ro
+      - ./emulation/kernels:/opt/kernels:ro
+    networks:
+      - default
+      - emulation_net
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+          cpus: "1.0"
+
+  fuzzing:
+    build:
+      context: ./fuzzing
+      dockerfile: Dockerfile
+    image: firmwareguard-fuzzing
+    volumes:
+      - firmware_data:/data/firmware:ro
+    networks:
+      - default
+    deploy:
+      resources:
+        limits:
+          memory: 2048M
+          cpus: "2.0"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: firmwareguard-frontend
+    container_name: firmwareguard-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+    name: firmwareguard_pgdata
+  redisdata:
+    name: firmwareguard_redisdata
+  firmware_data:
+    name: firmwareguard_firmware_data
+
+networks:
+  default:
+    name: firmwareguard_default
+  emulation_net:
+    name: firmwareguard_emulation_net
+    internal: true

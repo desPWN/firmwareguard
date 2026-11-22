@@ -1,0 +1,989 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { useParams, useSearchParams } from 'react-router-dom'
+import {
+  Play,
+  Square,
+  Loader2,
+  RefreshCw,
+  TerminalSquare,
+  Plus,
+  Trash2,
+  Cpu,
+  Clock,
+  AlertCircle,
+  FileText,
+  ChevronDown,
+  ChevronUp,
+  Save,
+  BookOpen,
+} from 'lucide-react'
+import { Terminal } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { formatDate } from '@/utils/format'
+import {
+  startEmulation,
+  stopEmulation,
+  listSessions,
+  getSessionStatus,
+  getSessionLogs,
+  buildEmulationTerminalURL,
+  listPresets,
+  createPreset,
+  deletePreset,
+} from '@/api/emulation'
+import { listFirmware } from '@/api/firmware'
+import KernelManager from '@/components/emulation/KernelManager'
+import type {
+  EmulationSession,
+  EmulationMode,
+  EmulationStatus,
+  PortForward,
+  EmulationPreset,
+  StubProfile,
+} from '@/types'
+import '@xterm/xterm/css/xterm.css'
+
+const STATUS_CONFIG: Record<EmulationStatus, { label: string; className: string }> = {
+  created: { label: 'CREATED', className: 'bg-zinc-800/70 text-zinc-400 border border-zinc-700' },
+  starting: { label: 'STARTING', className: 'bg-amber-500/15 text-amber-400 border border-amber-500/40' },
+  running: { label: 'RUNNING', className: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/40' },
+  stopped: { label: 'STOPPED', className: 'bg-zinc-800/70 text-zinc-400 border border-zinc-700' },
+  error: { label: 'ERROR', className: 'bg-red-500/15 text-red-400 border border-red-500/40' },
+}
+
+export default function EmulationPage() {
+  const { projectId } = useParams<{ projectId: string }>()
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  const [sessions, setSessions] = useState<EmulationSession[]>([])
+  const [loading, setLoading] = useState(true)
+  const [starting, setStarting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  // Start form state
+  const [mode, setMode] = useState<EmulationMode>('user')
+  const [binaryPath, setBinaryPath] = useState('')
+  const [arguments_, setArguments] = useState('')
+  const [portForwards, setPortForwards] = useState<PortForward[]>([])
+
+  // Kernel selection (system mode)
+  const [kernelName, setKernelName] = useState<string | null>(null)
+  const [firmwareArch, setFirmwareArch] = useState<string | null>(null)
+  const [firmwareKernelPath, setFirmwareKernelPath] = useState<string | null>(null)
+  const [initPath, setInitPath] = useState('')
+  const [preInitScript, setPreInitScript] = useState('')
+  const [stubProfile, setStubProfile] = useState<StubProfile>('none')
+
+  // Presets
+  const [presets, setPresets] = useState<EmulationPreset[]>([])
+  const [showSavePreset, setShowSavePreset] = useState(false)
+  const [presetName, setPresetName] = useState('')
+  const [presetDescription, setPresetDescription] = useState('')
+  const [savingPreset, setSavingPreset] = useState(false)
+
+  // Active session + terminal
+  const [activeSession, setActiveSession] = useState<EmulationSession | null>(null)
+  const [showTerminal, setShowTerminal] = useState(false)
+
+  const loadSessions = useCallback(async () => {
+    if (!projectId) return
+    try {
+      const data = await listSessions(projectId)
+      setSessions(data)
+
+      // Auto-select the first running session
+      const running = data.find((s) => s.status === 'running')
+      if (running && !activeSession) {
+        setActiveSession(running)
+      }
+    } catch {
+      // ignore
+    } finally {
+      setLoading(false)
+    }
+  }, [projectId, activeSession])
+
+  const loadPresets = useCallback(async () => {
+    if (!projectId) return
+    try {
+      const data = await listPresets(projectId)
+      setPresets(data)
+    } catch {
+      // ignore
+    }
+  }, [projectId])
+
+  // Pre-fill binary path from ?binary= query parameter
+  useEffect(() => {
+    const binary = searchParams.get('binary')
+    if (binary) {
+      setBinaryPath(binary)
+      setMode('user')
+      // Clear the query param so it doesn't persist on refresh
+      setSearchParams({}, { replace: true })
+    }
+  }, [searchParams, setSearchParams])
+
+  useEffect(() => {
+    loadSessions()
+    loadPresets()
+  }, [loadSessions, loadPresets])
+
+  // Fetch firmware architecture for kernel selection
+  useEffect(() => {
+    if (!projectId) return
+    listFirmware(projectId)
+      .then((fwList) => {
+        const fw = fwList[0]
+        if (fw) {
+          setFirmwareArch(fw.architecture ?? null)
+          setFirmwareKernelPath(fw.kernel_path ?? null)
+        }
+      })
+      .catch(() => {})
+  }, [projectId])
+
+  // Poll for status updates (faster during active sessions)
+  useEffect(() => {
+    if (!projectId) return
+    const hasActive = sessions.some((s) => s.status === 'running' || s.status === 'starting')
+    if (!hasActive) return
+
+    const interval = setInterval(loadSessions, 2000)
+    return () => clearInterval(interval)
+  }, [projectId, sessions, loadSessions])
+
+  const handleStart = async () => {
+    if (!projectId) return
+    if (mode === 'user' && !binaryPath.trim()) {
+      setError('Binary path is required for user-mode emulation')
+      return
+    }
+
+    setStarting(true)
+    setError(null)
+
+    try {
+      const session = await startEmulation(projectId, {
+        mode,
+        binary_path: mode === 'user' ? binaryPath.trim() : undefined,
+        arguments: mode === 'user' && arguments_.trim() ? arguments_.trim() : undefined,
+        port_forwards: mode === 'system' && portForwards.length > 0 ? portForwards : undefined,
+        kernel_name: mode === 'system' && kernelName ? kernelName : undefined,
+        init_path: mode === 'system' && initPath.trim() ? initPath.trim() : undefined,
+        pre_init_script: mode === 'system' && preInitScript.trim() ? preInitScript.trim() : undefined,
+        stub_profile: mode === 'system' && stubProfile !== 'none' ? stubProfile : undefined,
+      })
+      setActiveSession(session)
+      if (session.status === 'running' || session.status === 'error') {
+        setShowTerminal(session.status === 'running')
+      }
+      await loadSessions()
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to start emulation'
+      // Try to extract API error detail
+      if (typeof err === 'object' && err !== null && 'response' in err) {
+        const resp = (err as { response?: { data?: { detail?: string } } }).response
+        if (resp?.data?.detail) {
+          setError(resp.data.detail)
+        } else {
+          setError(msg)
+        }
+      } else {
+        setError(msg)
+      }
+    } finally {
+      setStarting(false)
+    }
+  }
+
+  const handleStop = async (sessionId: string) => {
+    if (!projectId) return
+    try {
+      await stopEmulation(projectId, sessionId)
+      if (activeSession?.id === sessionId) {
+        setShowTerminal(false)
+        setActiveSession(null)
+      }
+      await loadSessions()
+    } catch {
+      // ignore
+    }
+  }
+
+  const handleConnect = async (session: EmulationSession) => {
+    if (!projectId) return
+    // Refresh status
+    try {
+      const updated = await getSessionStatus(projectId, session.id)
+      setActiveSession(updated)
+      if (updated.status === 'running') {
+        setShowTerminal(true)
+      }
+    } catch {
+      setActiveSession(session)
+      if (session.status === 'running') {
+        setShowTerminal(true)
+      }
+    }
+  }
+
+  const addPortForward = () => {
+    setPortForwards([...portForwards, { host: 8080, guest: 80 }])
+  }
+
+  const removePortForward = (index: number) => {
+    setPortForwards(portForwards.filter((_, i) => i !== index))
+  }
+
+  const updatePortForward = (index: number, field: 'host' | 'guest', value: number) => {
+    const updated = [...portForwards]
+    updated[index] = { ...updated[index], [field]: value }
+    setPortForwards(updated)
+  }
+
+  const loadPresetIntoForm = (preset: EmulationPreset) => {
+    setMode(preset.mode)
+    setBinaryPath(preset.binary_path || '')
+    setArguments(preset.arguments || '')
+    setPortForwards(preset.port_forwards || [])
+    setKernelName(preset.kernel_name || null)
+    setInitPath(preset.init_path || '')
+    setPreInitScript(preset.pre_init_script || '')
+    setStubProfile(preset.stub_profile || 'none')
+  }
+
+  const handleSavePreset = async () => {
+    if (!projectId || !presetName.trim()) return
+    setSavingPreset(true)
+    try {
+      await createPreset(projectId, {
+        name: presetName.trim(),
+        description: presetDescription.trim() || undefined,
+        mode,
+        binary_path: mode === 'user' ? binaryPath.trim() || undefined : undefined,
+        arguments: mode === 'user' && arguments_.trim() ? arguments_.trim() : undefined,
+        architecture: firmwareArch || undefined,
+        port_forwards: mode === 'system' && portForwards.length > 0 ? portForwards : undefined,
+        kernel_name: mode === 'system' && kernelName ? kernelName : undefined,
+        init_path: mode === 'system' && initPath.trim() ? initPath.trim() : undefined,
+        pre_init_script: mode === 'system' && preInitScript.trim() ? preInitScript.trim() : undefined,
+        stub_profile: mode === 'system' && stubProfile !== 'none' ? stubProfile : undefined,
+      })
+      setShowSavePreset(false)
+      setPresetName('')
+      setPresetDescription('')
+      await loadPresets()
+    } catch {
+      // ignore
+    } finally {
+      setSavingPreset(false)
+    }
+  }
+
+  const handleDeletePreset = async (presetId: string) => {
+    if (!projectId) return
+    try {
+      await deletePreset(projectId, presetId)
+      await loadPresets()
+    } catch {
+      // ignore
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex h-full items-center justify-center">
+        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+      </div>
+    )
+  }
+
+  return (
+    <div className="-m-6 flex h-[calc(100vh-3.5rem)] flex-col">
+      {/* Header */}
+      <div className="border-b border-border px-6 py-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-xl font-semibold tracking-tight">
+              Firmware Emulation
+            </h1>
+            <p className="text-sm text-muted-foreground">
+              Run firmware binaries or boot the full OS using QEMU
+            </p>
+          </div>
+          <Button variant="outline" size="sm" onClick={loadSessions}>
+            <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+            Refresh
+          </Button>
+        </div>
+      </div>
+
+      <div className="flex flex-1 overflow-hidden">
+        {/* Left panel — controls + session list */}
+        <div className="w-96 shrink-0 overflow-y-auto border-r border-border p-4 space-y-6">
+          {/* Presets */}
+          {presets.length > 0 && (
+            <div className="space-y-2">
+              <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+                <BookOpen className="mr-1.5 inline h-3.5 w-3.5" />
+                Presets
+              </h2>
+              {presets.map((preset) => (
+                <div
+                  key={preset.id}
+                  className="group flex items-center justify-between rounded-md border border-border px-3 py-2 hover:border-primary/50 transition-colors"
+                >
+                  <button
+                    onClick={() => loadPresetIntoForm(preset)}
+                    className="flex-1 text-left min-w-0"
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="text-sm font-medium truncate">{preset.name}</span>
+                      <Badge variant="outline" className="text-[10px]">
+                        {preset.mode}
+                      </Badge>
+                      {preset.stub_profile && preset.stub_profile !== 'none' && (
+                        <Badge variant="secondary" className="text-[10px]">
+                          stubs: {preset.stub_profile}
+                        </Badge>
+                      )}
+                    </div>
+                    {preset.description && (
+                      <p className="mt-0.5 text-xs text-muted-foreground truncate">
+                        {preset.description}
+                      </p>
+                    )}
+                  </button>
+                  <button
+                    onClick={() => handleDeletePreset(preset.id)}
+                    className="ml-2 text-muted-foreground opacity-0 group-hover:opacity-100 hover:text-destructive transition-opacity"
+                    title="Delete preset"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Start Emulation Form */}
+          <div className="space-y-4">
+            <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+              Start Emulation
+            </h2>
+
+            {/* Mode selector */}
+            <div className="flex gap-2">
+              <button
+                onClick={() => setMode('user')}
+                className={`flex-1 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                  mode === 'user'
+                    ? 'border-primary bg-primary/10 text-primary'
+                    : 'border-border text-muted-foreground hover:border-primary/50'
+                }`}
+              >
+                <Cpu className="mb-1 inline h-4 w-4" /> User Mode
+              </button>
+              <button
+                onClick={() => setMode('system')}
+                className={`flex-1 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
+                  mode === 'system'
+                    ? 'border-primary bg-primary/10 text-primary'
+                    : 'border-border text-muted-foreground hover:border-primary/50'
+                }`}
+              >
+                <TerminalSquare className="mb-1 inline h-4 w-4" /> System Mode
+              </button>
+            </div>
+
+            <p className="text-xs text-muted-foreground">
+              {mode === 'user'
+                ? 'Run a single binary in a chroot. Fast, good for testing specific programs.'
+                : 'Boot the full firmware OS. Slower, good for testing services and network.'}
+            </p>
+
+            {/* User mode fields */}
+            {mode === 'user' && (
+              <>
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    Binary Path *
+                  </label>
+                  <input
+                    type="text"
+                    value={binaryPath}
+                    onChange={(e) => setBinaryPath(e.target.value)}
+                    placeholder="/usr/sbin/httpd"
+                    className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:border-primary focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                    Arguments
+                  </label>
+                  <input
+                    type="text"
+                    value={arguments_}
+                    onChange={(e) => setArguments(e.target.value)}
+                    placeholder="--help"
+                    className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:border-primary focus:outline-none"
+                  />
+                </div>
+              </>
+            )}
+
+            {/* System mode fields */}
+            {mode === 'system' && (
+              <>
+              <KernelManager
+                firmwareArchitecture={firmwareArch}
+                firmwareKernelPath={firmwareKernelPath}
+                onKernelSelect={setKernelName}
+                selectedKernel={kernelName}
+              />
+              <div>
+                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                  Init Override
+                </label>
+                <input
+                  type="text"
+                  value={initPath}
+                  onChange={(e) => setInitPath(e.target.value)}
+                  placeholder="/bin/sh (leave empty for default /sbin/init)"
+                  className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:border-primary focus:outline-none"
+                />
+                <p className="mt-0.5 text-xs text-muted-foreground/60">
+                  Override if /sbin/init is broken or wrong architecture
+                </p>
+              </div>
+              <div>
+                <div className="mb-2 flex items-center justify-between">
+                  <label className="text-xs font-medium text-muted-foreground">
+                    Port Forwarding
+                  </label>
+                  <button
+                    onClick={addPortForward}
+                    className="flex items-center gap-1 text-xs text-primary hover:underline"
+                  >
+                    <Plus className="h-3 w-3" /> Add
+                  </button>
+                </div>
+                {portForwards.length === 0 && (
+                  <p className="text-xs text-muted-foreground/60">No port forwards configured</p>
+                )}
+                {portForwards.map((pf, i) => (
+                  <div key={i} className="mb-1.5 flex items-center gap-2">
+                    <input
+                      type="number"
+                      value={pf.host}
+                      onChange={(e) => updatePortForward(i, 'host', parseInt(e.target.value) || 0)}
+                      className="w-20 rounded border border-border bg-background px-2 py-1 text-xs"
+                      placeholder="Host"
+                    />
+                    <span className="text-xs text-muted-foreground">→</span>
+                    <input
+                      type="number"
+                      value={pf.guest}
+                      onChange={(e) => updatePortForward(i, 'guest', parseInt(e.target.value) || 0)}
+                      className="w-20 rounded border border-border bg-background px-2 py-1 text-xs"
+                      placeholder="Guest"
+                    />
+                    <button
+                      onClick={() => removePortForward(i)}
+                      className="text-muted-foreground hover:text-destructive"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                  Stub Libraries
+                </label>
+                <select
+                  value={stubProfile}
+                  onChange={(e) => setStubProfile(e.target.value as StubProfile)}
+                  className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:border-primary focus:outline-none"
+                >
+                  <option value="none">None — no stubs injected</option>
+                  <option value="generic">Generic — MTD flash + wireless ioctl stubs</option>
+                  <option value="tenda">Tenda — generic + Tenda-specific stubs</option>
+                </select>
+                <p className="mt-0.5 text-xs text-muted-foreground/60">
+                  LD_PRELOAD stub libraries for hardware emulation. Use &quot;generic&quot; for most firmware, &quot;tenda&quot; for Tenda devices.
+                </p>
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                  Pre-Init Script
+                </label>
+                <textarea
+                  value={preInitScript}
+                  onChange={(e) => setPreInitScript(e.target.value)}
+                  placeholder={"# Runs before firmware init\n/bin/cfmd &\nsleep 1\n/bin/httpd &"}
+                  rows={5}
+                  className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm font-mono focus:border-primary focus:outline-none resize-y"
+                />
+                <p className="mt-0.5 text-xs text-muted-foreground/60">
+                  Shell script sourced before firmware init (service startup, config setup, etc.)
+                </p>
+              </div>
+              </>
+            )}
+
+            {error && (
+              <div className="flex items-start gap-2 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                {error}
+              </div>
+            )}
+
+            <div className="flex gap-2">
+              <Button
+                onClick={handleStart}
+                disabled={starting}
+                className="flex-1"
+              >
+                {starting ? (
+                  <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
+                ) : (
+                  <Play className="mr-1.5 h-4 w-4" />
+                )}
+                {starting ? 'Starting...' : 'Start'}
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => setShowSavePreset(!showSavePreset)}
+                title="Save as preset"
+              >
+                <Save className="h-4 w-4" />
+              </Button>
+            </div>
+
+            {/* Save as Preset dialog */}
+            {showSavePreset && (
+              <div className="rounded-md border border-border bg-card p-3 space-y-2">
+                <p className="text-xs font-medium text-muted-foreground">Save current config as preset</p>
+                <input
+                  type="text"
+                  value={presetName}
+                  onChange={(e) => setPresetName(e.target.value)}
+                  placeholder="Preset name"
+                  className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:border-primary focus:outline-none"
+                />
+                <input
+                  type="text"
+                  value={presetDescription}
+                  onChange={(e) => setPresetDescription(e.target.value)}
+                  placeholder="Description (optional)"
+                  className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:border-primary focus:outline-none"
+                />
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    onClick={handleSavePreset}
+                    disabled={savingPreset || !presetName.trim()}
+                    className="flex-1"
+                  >
+                    {savingPreset ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Save className="mr-1.5 h-3.5 w-3.5" />
+                    )}
+                    Save
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => setShowSavePreset(false)}
+                  >
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Session list */}
+          <div className="space-y-3">
+            <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+              Sessions ({sessions.length})
+            </h2>
+
+            {sessions.length === 0 && (
+              <p className="text-xs text-muted-foreground/60">No emulation sessions yet</p>
+            )}
+
+            {sessions.map((session) => (
+              <SessionCard
+                key={session.id}
+                session={session}
+                isActive={activeSession?.id === session.id}
+                projectId={projectId!}
+                onConnect={() => handleConnect(session)}
+                onStop={() => handleStop(session.id)}
+              />
+            ))}
+          </div>
+        </div>
+
+        {/* Center panel — terminal */}
+        <div className="relative flex-1 bg-[#0a0a0b]">
+          {showTerminal && activeSession && projectId ? (
+            <EmulationTerminal
+              projectId={projectId}
+              session={activeSession}
+              onClose={() => setShowTerminal(false)}
+            />
+          ) : (
+            <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+              <div className="text-center">
+                <TerminalSquare className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
+                <p>Start an emulation session or connect to a running one</p>
+                <p className="mt-1 text-xs text-muted-foreground/60">
+                  The terminal will appear here when a session is active
+                </p>
+              </div>
+            </div>
+          )}
+
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Session card with error display and log viewer ──
+
+interface SessionCardProps {
+  session: EmulationSession
+  isActive: boolean
+  projectId: string
+  onConnect: () => void
+  onStop: () => void
+}
+
+function SessionCard({ session, isActive, projectId, onConnect, onStop }: SessionCardProps) {
+  const statusCfg = STATUS_CONFIG[session.status] || STATUS_CONFIG.stopped
+  const [showLogs, setShowLogs] = useState(false)
+  const [logs, setLogs] = useState<string | null>(null)
+  const [logsLoading, setLogsLoading] = useState(false)
+
+  const handleViewLogs = async () => {
+    if (showLogs) {
+      setShowLogs(false)
+      return
+    }
+    setShowLogs(true)
+    setLogsLoading(true)
+    try {
+      const logText = await getSessionLogs(projectId, session.id)
+      setLogs(logText)
+    } catch {
+      setLogs('Failed to fetch logs')
+    } finally {
+      setLogsLoading(false)
+    }
+  }
+
+  return (
+    <div
+      className={`rounded-lg border p-3 transition-colors ${
+        isActive
+          ? 'border-primary/50 bg-primary/5'
+          : 'border-border hover:border-border/80'
+      }`}
+    >
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Badge className={`text-[10px] ${statusCfg.className}`}>
+            {statusCfg.label}
+          </Badge>
+          <span className="text-xs font-medium">
+            {session.mode === 'user' ? 'User' : 'System'} Mode
+          </span>
+        </div>
+        {session.architecture && (
+          <Badge variant="outline" className="text-[10px]">
+            {session.architecture}
+          </Badge>
+        )}
+      </div>
+
+      {session.binary_path && (
+        <p className="mt-1 truncate text-xs text-muted-foreground font-mono">
+          {session.binary_path}
+        </p>
+      )}
+
+      <div className="mt-1 flex items-center gap-2 text-[10px] text-muted-foreground">
+        <Clock className="h-3 w-3" />
+        {formatDate(session.created_at)}
+      </div>
+
+      {/* Error message — prominent display */}
+      {session.error_message && (
+        <div className="mt-2 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <div className="min-w-0">
+              <p className="font-medium">Emulation failed</p>
+              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words text-[11px] opacity-90 font-mono">
+                {session.error_message}
+              </pre>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-2 flex flex-wrap gap-2">
+        {session.status === 'running' && (
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={onConnect}
+            >
+              <TerminalSquare className="mr-1 h-3 w-3" />
+              Connect
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={onStop}
+            >
+              <Square className="mr-1 h-3 w-3" />
+              Stop
+            </Button>
+          </>
+        )}
+        {/* View Logs button — available for any session with a container */}
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 text-xs"
+          onClick={handleViewLogs}
+        >
+          <FileText className="mr-1 h-3 w-3" />
+          Logs
+          {showLogs ? <ChevronUp className="ml-1 h-3 w-3" /> : <ChevronDown className="ml-1 h-3 w-3" />}
+        </Button>
+      </div>
+
+      {/* Expandable log viewer */}
+      {showLogs && (
+        <div className="mt-2 rounded-md border border-border bg-[#0a0a0b] p-2">
+          {logsLoading ? (
+            <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              Loading logs...
+            </div>
+          ) : (
+            <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words text-[11px] text-zinc-300 font-mono">
+              {logs || 'No logs available'}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Embedded terminal component ──
+
+interface EmulationTerminalProps {
+  projectId: string
+  session: EmulationSession
+  onClose: () => void
+}
+
+function EmulationTerminal({ projectId, session, onClose }: EmulationTerminalProps) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const termRef = useRef<Terminal | null>(null)
+  const fitAddonRef = useRef<FitAddon | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const reconnectAttemptRef = useRef(0)
+  const intentionalCloseRef = useRef(false)
+
+  useEffect(() => {
+    if (!containerRef.current || session.status !== 'running') return
+    intentionalCloseRef.current = false
+    reconnectAttemptRef.current = 0
+
+    const term = new Terminal({
+      cursorBlink: true,
+      fontSize: 13,
+      fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
+      theme: {
+        background: '#0a0a0b',
+        foreground: '#e4e4e7',
+        cursor: '#e4e4e7',
+        selectionBackground: '#27272a',
+        black: '#09090b',
+        red: '#ef4444',
+        green: '#22c55e',
+        yellow: '#eab308',
+        blue: '#3b82f6',
+        magenta: '#a855f7',
+        cyan: '#06b6d4',
+        white: '#e4e4e7',
+        brightBlack: '#52525b',
+        brightRed: '#f87171',
+        brightGreen: '#4ade80',
+        brightYellow: '#facc15',
+        brightBlue: '#60a5fa',
+        brightMagenta: '#c084fc',
+        brightCyan: '#22d3ee',
+        brightWhite: '#fafafa',
+      },
+      scrollback: 5000,
+      convertEol: true,
+    })
+
+    const fitAddon = new FitAddon()
+    term.loadAddon(fitAddon)
+    fitAddonRef.current = fitAddon
+    termRef.current = term
+
+    term.open(containerRef.current)
+    requestAnimationFrame(() => fitAddon.fit())
+
+    const MAX_RECONNECT_ATTEMPTS = 10
+    const RECONNECT_BASE_DELAY = 1000
+
+    function connectWebSocket() {
+      const url = buildEmulationTerminalURL(projectId, session.id)
+      const ws = new WebSocket(url)
+      wsRef.current = ws
+
+      ws.onopen = () => {
+        reconnectAttemptRef.current = 0
+        ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }))
+      }
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data)
+          if (msg.type === 'output' && msg.data) {
+            term.write(msg.data)
+          } else if (msg.type === 'error') {
+            term.write(`\r\n\x1b[31mError: ${msg.data}\x1b[0m\r\n`)
+          }
+          // Ignore ping/pong messages (keepalive)
+        } catch {
+          term.write(event.data)
+        }
+      }
+
+      ws.onclose = () => {
+        if (intentionalCloseRef.current) return
+
+        const attempt = reconnectAttemptRef.current
+        if (attempt < MAX_RECONNECT_ATTEMPTS) {
+          const delay = Math.min(RECONNECT_BASE_DELAY * Math.pow(1.5, attempt), 10000)
+          term.write(`\r\n\x1b[90m[Disconnected — reconnecting in ${Math.round(delay / 1000)}s...]\x1b[0m\r\n`)
+          reconnectAttemptRef.current = attempt + 1
+          reconnectTimerRef.current = setTimeout(connectWebSocket, delay)
+        } else {
+          term.write('\r\n\x1b[90m[Session disconnected — max reconnect attempts reached]\x1b[0m\r\n')
+          getSessionLogs(projectId, session.id)
+            .then((logText) => {
+              if (logText && logText !== '(no log available)') {
+                term.write('\r\n\x1b[33m--- QEMU Startup Log ---\x1b[0m\r\n')
+                term.write(logText.replace(/\n/g, '\r\n'))
+                term.write('\r\n\x1b[33m--- End Log ---\x1b[0m\r\n')
+              }
+            })
+            .catch(() => {})
+        }
+      }
+
+      ws.onerror = () => {
+        // onclose will fire after onerror, reconnect handled there
+      }
+    }
+
+    connectWebSocket()
+
+    const onData = term.onData((data: string) => {
+      const ws = wsRef.current
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'input', data }))
+      }
+    })
+
+    return () => {
+      intentionalCloseRef.current = true
+      onData.dispose()
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = null
+      }
+      const ws = wsRef.current
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        ws.close()
+      }
+      wsRef.current = null
+      termRef.current = null
+      fitAddonRef.current = null
+      term.dispose()
+    }
+  }, [projectId, session.id, session.status])
+
+  // Resize observer
+  useEffect(() => {
+    if (!containerRef.current) return
+
+    const observer = new ResizeObserver(() => {
+      const fitAddon = fitAddonRef.current
+      const term = termRef.current
+      const ws = wsRef.current
+      if (!fitAddon || !term) return
+      try {
+        fitAddon.fit()
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }))
+        }
+      } catch {
+        // ignore
+      }
+    })
+    observer.observe(containerRef.current)
+    return () => observer.disconnect()
+  }, [])
+
+  return (
+    <div className="flex h-full flex-col">
+      {/* Terminal header */}
+      <div className="flex items-center gap-2 border-b border-border bg-[#0a0a0b] px-3 py-1.5">
+        <TerminalSquare className="h-3.5 w-3.5 text-muted-foreground" />
+        <span className="text-xs font-medium text-muted-foreground">
+          Emulation Terminal — {session.mode} mode
+          {session.architecture ? ` (${session.architecture})` : ''}
+        </span>
+        <Badge
+          className={`ml-auto text-[10px] ${STATUS_CONFIG[session.status]?.className || ''}`}
+        >
+          {session.status}
+        </Badge>
+        <button
+          onClick={onClose}
+          className="rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+          title="Close terminal"
+        >
+          <Square className="h-3.5 w-3.5" />
+        </button>
+      </div>
+
+      {/* Terminal container */}
+      <div ref={containerRef} className="flex-1 px-1 py-1" />
+    </div>
+  )
+}

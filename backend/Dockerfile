@@ -1,0 +1,109 @@
+FROM python:3.12-slim AS base
+
+# Install system dependencies for firmware analysis
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    binwalk \
+    sleuthkit \
+    squashfs-tools \
+    cramfsswap \
+    mtd-utils \
+    e2fsprogs \
+    cpio \
+    p7zip-full \
+    cabextract \
+    lzop \
+    srecord \
+    file \
+    libmagic1 \
+    build-essential \
+    git \
+    zlib1g-dev \
+    liblzma-dev \
+    liblzo2-dev \
+    wget \
+    curl \
+    unzip \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libgdk-pixbuf-2.0-0 \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python-based firmware extraction tools used by binwalk
+RUN pip3 install --no-cache-dir --break-system-packages \
+    jefferson \
+    ubi_reader \
+    && pip3 install --no-cache-dir --break-system-packages \
+       git+https://github.com/devttys0/yaffshiv.git 2>/dev/null \
+    || echo "WARN: yaffshiv install failed — YAFFS extraction won't work"
+
+# Install sasquatch for non-standard SquashFS (vendor-modified)
+# Patch -Werror, add -fcommon for GCC 10+, and fix duplicate extern verbose definition
+RUN git clone https://github.com/devttys0/sasquatch.git /tmp/sasquatch \
+    && cd /tmp/sasquatch \
+    && sed -i 's/-Wall -Werror/-Wall -fcommon -Wno-error/g' patches/patch0.txt \
+    && wget -q https://downloads.sourceforge.net/project/squashfs/squashfs/squashfs4.3/squashfs4.3.tar.gz \
+    && tar -xzf squashfs4.3.tar.gz \
+    && cd squashfs4.3 \
+    && patch -p0 < ../patches/patch0.txt \
+    && cd squashfs-tools \
+    && sed -i 's/^int verbose;/extern int verbose;/' error.h \
+    && sed -i '1i int verbose = 0;' unsquashfs.c \
+    && make \
+    && cp sasquatch /usr/local/bin/sasquatch \
+    && rm -rf /tmp/sasquatch \
+    && test -x /usr/local/bin/sasquatch
+
+# Install OpenJDK 21 for Ghidra (JDK 17 not available in Trixie)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-21-jdk-headless \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Ghidra
+ARG GHIDRA_VERSION=11.3.1
+ARG GHIDRA_DATE=20250219
+RUN wget -q "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_DATE}.zip" \
+        -O /tmp/ghidra.zip \
+    && unzip -q /tmp/ghidra.zip -d /opt \
+    && mv /opt/ghidra_${GHIDRA_VERSION}_PUBLIC /opt/ghidra \
+    && rm /tmp/ghidra.zip
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Create non-root user and add to docker group for emulation container management.
+# The docker socket GID from the host is passed via build arg (default 999).
+ARG DOCKER_GID=999
+RUN groupadd -g ${DOCKER_GID} docker || true \
+    && useradd -m -s /bin/bash firmwareguard \
+    && usermod -aG docker firmwareguard
+
+# Set up working directory
+WORKDIR /app
+
+# Copy dependency files first for caching
+COPY pyproject.toml uv.lock* ./
+
+# Install dependencies
+RUN uv sync --no-dev --no-editable 2>/dev/null || uv sync --no-editable
+
+# Copy application code
+COPY . .
+
+# Bake in default emulation kernels so they're available out of the box.
+# The docker-compose bind mount (./emulation/kernels:/opt/kernels) overlays
+# on top at runtime, allowing users to add custom kernels.
+COPY --from=kernels . /opt/kernels/
+
+# Create data and Ghidra project directories
+RUN mkdir -p /data/firmware /tmp/ghidra_projects \
+    && chown -R firmwareguard:firmwareguard /data /app /tmp/ghidra_projects /opt/ghidra /opt/kernels
+
+USER firmwareguard
+
+ENV PATH="/app/.venv/bin:$PATH"
+ENV GHIDRA_INSTALL_DIR=/opt/ghidra
+
+EXPOSE 8000
+
+CMD ["sh", "-c", "uv run python -m app.preflight_db && uv run alembic upgrade head && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000"]

@@ -1,0 +1,43 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+.pytest_cache/
+dist/
+build/
+
+# Data & local firmware test binaries
+/data/
+backend/data/
+/*.bin
+
+# Agent / workspace scratch
+.agents/
+.backups/
+.impeccable/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (frontend)
+node_modules/
+frontend/dist/
+
+# MkDocs
+site/
+
+# Docker
+docker-compose.override.yml

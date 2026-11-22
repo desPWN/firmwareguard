@@ -1,0 +1,7 @@
+{
+  "architecture": "mips",
+  "description": "Debian Linux 3.2.0-4-4kc-malta for QEMU MIPS big-endian emulation",
+  "uploaded_at": "2026-10-28T14:24:00.000000+00:00",
+  "source_url": "https://people.debian.org/~aurel32/qemu/mips/vmlinux-3.2.0-4-4kc-malta"
+}
+
