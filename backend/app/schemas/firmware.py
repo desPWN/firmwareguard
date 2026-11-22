@@ -76,3 +76,47 @@ class FirmwareMetadataResponse(BaseModel):
     uboot_header: UBootHeaderResponse | None = None
     uboot_env: dict[str, str] = {}
     mtd_partitions: list[MTDPartitionResponse] = []
+
+
+# ── Entropy & Decryption schemas ──
+
+
+class EntropyBlockResponse(BaseModel):
+    offset: int
+    size: int
+    entropy: float
+
+
+class FirmwareEntropyResponse(BaseModel):
+    file_size: int
+    overall_entropy: float
+    min_entropy: float
+    max_entropy: float
+    high_entropy_ratio: float
+    verdict: str
+    detected_format: str | None = None
+    detected_format_label: str | None = None
+    known_signatures: list[str] = []
+    summary: str
+    blocks: list[EntropyBlockResponse] = []
+
+
+class FirmwareDecryptRequest(BaseModel):
+    mode: str = "custom"  # "auto" | "custom"
+    algorithm: str = "aes-128-cbc"
+    key: str = ""
+    key_format: str = "hex"  # "hex" | "utf8"
+    iv: str = ""
+    offset: int = 0
+    unpad: bool = False
+    auto_unpack: bool = True
+
+
+class FirmwareDecryptResponse(BaseModel):
+    success: bool
+    method: str
+    output_size: int
+    post_entropy: float
+    known_signatures: list[str] = []
+    unpack_started: bool = False
+    message: str

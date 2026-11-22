@@ -51,7 +51,7 @@ Once the containers come up:
 
 | Module | What it does |
 | :--- | :--- |
-| **Firmware Unpacking** | Extracts SquashFS (including vendor-modified formats via `sasquatch`), JFFS2, UBIFS, CramFS, ext, and CPIO images automatically with multi-partition support. |
+| **Firmware Unpacking & Decryption** | Extracts SquashFS (including vendor-modified formats via `sasquatch`), JFFS2, UBIFS, CramFS, ext, and CPIO images; auto-decrypts D-Link SHRS, Hikvision `digicap.dav`, and Netgear CHK wrappers; includes Shannon entropy profiling and a custom Key/IV (AES-CBC/CTR/ECB, XOR, header-strip) decryptor. |
 | **File Explorer** | Virtual filesystem tree, syntax-highlighted code viewer (Monaco), hex viewer, and full-text search across the extracted rootfs. |
 | **Binary Hardening Audit** | Scans every ELF executable and shared library for NX, Stack Canary, PIE, Full/Partial RELRO, and FORTIFY, scoring the overall posture. |
 | **Secrets & Credential Harvester** | Extracts unencrypted private keys, expired/weak X.509 certificates, router config defaults, and `/etc/shadow` accounts with built-in IoT default password cracking. |
@@ -229,7 +229,7 @@ firmwareguard/
 
 ## Gotchas & Troubleshooting
 
-- **Encrypted firmware images won't unpack:** FirmwareGuard targets unencrypted embedded Linux firmware (SquashFS, JFFS2, UBIFS, CramFS, ext, CPIO). If a vendor encrypts the entire flash image, decrypt it first before uploading.
+- **Encrypted firmware images:** Known vendor wrappers (D-Link `SHRS`, Hikvision `digicap.dav`, Netgear `.chk`) decrypt automatically during unpack. For images encrypted with unknown device-specific keys, FirmwareGuard flags the uniform high Shannon entropy and provides a **Decrypt** workflow where you can enter a key/IV recovered via UART, SPI dump, or an older firmware version.
 - **Slow CVE scans:** Without an `NVD_API_KEY`, NIST throttles public API requests heavily. Grabbing a free key from NVD speeds up SBOM vulnerability scans dramatically.
 - **UART bridge on Linux:** Allow Docker containers to reach TCP `9999` (`sudo iptables -I INPUT -p tcp --dport 9999 -j ACCEPT`) and keep `UART_BRIDGE_HOST=host.docker.internal`.
 - **Good practice targets:** [OpenWrt](https://downloads.openwrt.org/), [DD-WRT](https://dd-wrt.com/), and [DVRF (Damn Vulnerable Router Firmware)](https://github.com/praetorian-inc/DVRF).

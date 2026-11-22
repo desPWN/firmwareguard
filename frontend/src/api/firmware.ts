@@ -1,5 +1,12 @@
 import apiClient from './client'
-import type { FirmwareDetail, FirmwareMetadata, FirmwareSummary } from '@/types'
+import type {
+  FirmwareDecryptRequest,
+  FirmwareDecryptResponse,
+  FirmwareDetail,
+  FirmwareEntropy,
+  FirmwareMetadata,
+  FirmwareSummary,
+} from '@/types'
 
 export async function uploadFirmware(
   projectId: string,
@@ -82,6 +89,28 @@ export async function getFirmwareMetadata(
 ): Promise<FirmwareMetadata> {
   const { data } = await apiClient.get<FirmwareMetadata>(
     `/projects/${projectId}/firmware/${firmwareId}/metadata`,
+  )
+  return data
+}
+
+export async function getFirmwareEntropy(
+  projectId: string,
+  firmwareId: string,
+): Promise<FirmwareEntropy> {
+  const { data } = await apiClient.get<FirmwareEntropy>(
+    `/projects/${projectId}/firmware/${firmwareId}/entropy`,
+  )
+  return data
+}
+
+export async function decryptFirmware(
+  projectId: string,
+  firmwareId: string,
+  payload: FirmwareDecryptRequest,
+): Promise<FirmwareDecryptResponse> {
+  const { data } = await apiClient.post<FirmwareDecryptResponse>(
+    `/projects/${projectId}/firmware/${firmwareId}/decrypt`,
+    payload,
   )
   return data
 }

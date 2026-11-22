@@ -32,6 +32,47 @@ export interface FirmwareDetail extends FirmwareSummary {
   unpack_log: string | null
 }
 
+export interface EntropyBlock {
+  offset: number
+  size: number
+  entropy: number
+}
+
+export interface FirmwareEntropy {
+  file_size: number
+  overall_entropy: number
+  min_entropy: number
+  max_entropy: number
+  high_entropy_ratio: number
+  verdict: 'auto_decryptable' | 'likely_encrypted' | 'compressed_or_mixed' | 'unencrypted'
+  detected_format: string | null
+  detected_format_label: string | null
+  known_signatures: string[]
+  summary: string
+  blocks: EntropyBlock[]
+}
+
+export interface FirmwareDecryptRequest {
+  mode: 'auto' | 'custom'
+  algorithm?: string
+  key?: string
+  key_format?: 'hex' | 'utf8'
+  iv?: string
+  offset?: number
+  unpad?: boolean
+  auto_unpack?: boolean
+}
+
+export interface FirmwareDecryptResponse {
+  success: boolean
+  method: string
+  output_size: number
+  post_entropy: number
+  known_signatures: string[]
+  unpack_started: boolean
+  message: string
+}
+
 export interface FileEntry {
   name: string
   type: 'file' | 'directory' | 'symlink' | 'other'

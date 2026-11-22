@@ -21,6 +21,7 @@ import {
   Copy,
   ShieldAlert,
   GitCompareArrows,
+  LockKeyhole,
 } from 'lucide-react'
 import { useProjectStore } from '@/stores/projectStore'
 import { listFirmware, deleteFirmware, updateFirmware } from '@/api/firmware'
@@ -46,6 +47,7 @@ import {
 } from '@/components/ui/split-flap'
 import { formatFileSize, formatDate } from '@/utils/format'
 import FirmwareUpload from '@/components/projects/FirmwareUpload'
+import FirmwareDecryptDialog from '@/components/projects/FirmwareDecryptDialog'
 import FirmwareMetadataCard from '@/components/projects/FirmwareMetadataCard'
 import DocumentsCard from '@/components/projects/DocumentsCard'
 import McpConnectionCard from '@/components/projects/McpConnectionCard'
@@ -93,6 +95,7 @@ export default function ProjectDetailPage() {
   const [editingVersionLabel, setEditingVersionLabel] = useState<string | null>(null)
   const [versionLabelDraft, setVersionLabelDraft] = useState('')
   const [copiedSha, setCopiedSha] = useState<string | null>(null)
+  const [decryptTarget, setDecryptTarget] = useState<{ id: string; filename: string } | null>(null)
   const versionInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -102,7 +105,7 @@ export default function ProjectDetailPage() {
 
   useEffect(() => {
     if (projectId && project) {
-      listFirmware(projectId).then(setFirmwareList).catch(() => {})
+      listFirmware(projectId).then(setFirmwareList).catch(() => { })
     }
   }, [project, projectId])
 
@@ -110,7 +113,7 @@ export default function ProjectDetailPage() {
     if (!projectId || project?.status !== 'unpacking') return
     const interval = setInterval(() => {
       fetchProject(projectId)
-      listFirmware(projectId).then(setFirmwareList).catch(() => {})
+      listFirmware(projectId).then(setFirmwareList).catch(() => { })
     }, 2000)
     return () => clearInterval(interval)
   }, [projectId, project?.status, fetchProject])
@@ -168,7 +171,7 @@ export default function ProjectDetailPage() {
     if (projectId) {
       try {
         await unpackFirmware(projectId, firmwareId)
-        listFirmware(projectId).then(setFirmwareList).catch(() => {})
+        listFirmware(projectId).then(setFirmwareList).catch(() => { })
       } catch {
         // error shown via store
       }
@@ -181,7 +184,7 @@ export default function ProjectDetailPage() {
     try {
       await deleteFirmware(projectId, firmwareId)
       fetchProject(projectId)
-      listFirmware(projectId).then(setFirmwareList).catch(() => {})
+      listFirmware(projectId).then(setFirmwareList).catch(() => { })
     } catch {
       // ignore
     }
@@ -221,7 +224,7 @@ export default function ProjectDetailPage() {
     try {
       await updateFirmware(projectId, fwId, { version_label: label })
       fetchProject(projectId)
-      listFirmware(projectId).then(setFirmwareList).catch(() => {})
+      listFirmware(projectId).then(setFirmwareList).catch(() => { })
     } catch {
       // ignore
     }
@@ -232,7 +235,7 @@ export default function ProjectDetailPage() {
     setShowUpload(false)
     if (projectId) {
       fetchProject(projectId)
-      listFirmware(projectId).then(setFirmwareList).catch(() => {})
+      listFirmware(projectId).then(setFirmwareList).catch(() => { })
     }
   }
 
@@ -246,10 +249,10 @@ export default function ProjectDetailPage() {
   const secSum = secretsData?.summary
   const exposedSecretsCount = secSum
     ? secSum.unencrypted_private_keys +
-      secSum.cracked_accounts +
-      secSum.empty_password_accounts +
-      secSum.router_default_credentials +
-      secSum.high_entropy_secrets
+    secSum.cracked_accounts +
+    secSum.empty_password_accounts +
+    secSum.router_default_credentials +
+    secSum.high_entropy_secrets
     : 0
   const hardSum = hardeningData?.summary
   const openFindingsCount = findings.filter((f) => f.status === 'open').length
@@ -678,6 +681,21 @@ export default function ProjectDetailPage() {
                         </div>
 
                         <div className="flex items-center gap-1">
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            onClick={() =>
+                              setDecryptTarget({
+                                id: fw.id,
+                                filename: fw.original_filename ?? 'firmware.bin',
+                              })
+                            }
+                            title="Inspect Shannon entropy or decrypt wrapped/encrypted firmware"
+                          >
+                            <LockKeyhole className="h-3.5 w-3.5" />
+                            Decrypt
+                          </Button>
                           {!isUnpacked && !hasError && (
                             <Button type="button" size="sm" onClick={() => handleUnpack(fw.id)} disabled={unpacking}>
                               {unpacking && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
@@ -741,16 +759,31 @@ export default function ProjectDetailPage() {
                           <pre className="max-h-36 overflow-auto rounded bg-background p-2.5 font-mono text-xs text-muted-foreground">
                             {fwDetail.unpack_log}
                           </pre>
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="outline"
-                            onClick={() => handleUnpack(fw.id)}
-                            disabled={unpacking}
-                          >
-                            {unpacking && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-                            Retry Unpack
-                          </Button>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              onClick={() => handleUnpack(fw.id)}
+                              disabled={unpacking}
+                            >
+                              {unpacking && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                              Retry Unpack
+                            </Button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              onClick={() =>
+                                setDecryptTarget({
+                                  id: fw.id,
+                                  filename: fw.original_filename ?? 'firmware.bin',
+                                })
+                              }
+                            >
+                              <LockKeyhole className="h-3.5 w-3.5" />
+                              Inspect Entropy / Decrypt
+                            </Button>
+                          </div>
                         </div>
                       )}
                     </div>
@@ -895,6 +928,22 @@ export default function ProjectDetailPage() {
           {hasUnpacked && <McpConnectionCard projectId={project.id} />}
         </div>
       </div>
+
+      {decryptTarget && (
+        <FirmwareDecryptDialog
+          open={true}
+          onOpenChange={(open) => {
+            if (!open) setDecryptTarget(null)
+          }}
+          projectId={project.id}
+          firmwareId={decryptTarget.id}
+          filename={decryptTarget.filename}
+          onDecrypted={() => {
+            fetchProject(project.id)
+            listFirmware(project.id).then(setFirmwareList).catch(() => { })
+          }}
+        />
+      )}
     </div>
   )
 }

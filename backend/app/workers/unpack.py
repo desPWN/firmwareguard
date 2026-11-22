@@ -1,9 +1,12 @@
 import asyncio
 import glob
 import os
+import shutil
 from dataclasses import dataclass, field
 
 from elftools.elf.elffile import ELFFile
+
+from app.services.decryption_service import analyze_encryption, auto_decrypt_if_known
 
 
 @dataclass
@@ -412,25 +415,52 @@ def detect_kernel(extraction_dir: str, fs_root: str | None) -> str | None:
 async def unpack_firmware(firmware_path: str, output_base_dir: str) -> UnpackResult:
     """Orchestrate the full unpacking pipeline."""
     result = UnpackResult()
+    log_prefix = ""
+    target_path = firmware_path
 
-    # Step 1: Run binwalk extraction
+    # Step 0: Auto-decrypt recognized vendor wrappers (D-Link SHRS, Hikvision DAV, Netgear CHK)
+    try:
+        dec_dir = os.path.join(output_base_dir, "decrypted")
+        auto_dec = await asyncio.to_thread(auto_decrypt_if_known, firmware_path, dec_dir)
+        if auto_dec and auto_dec.success:
+            target_path = auto_dec.output_path
+            log_prefix = f"[firmwareguard] {auto_dec.message}\n"
+    except Exception as exc:
+        log_prefix = f"[firmwareguard] Vendor auto-decrypt attempt skipped: {exc}\n"
+
+    # Step 1: Run binwalk extraction (clear any previous failed extraction directory)
     try:
         extraction_dir = os.path.join(output_base_dir, "extracted")
+        if os.path.isdir(extraction_dir):
+            shutil.rmtree(extraction_dir, ignore_errors=True)
         os.makedirs(extraction_dir, exist_ok=True)
-        result.unpack_log = await run_binwalk_extraction(firmware_path, extraction_dir)
+        binwalk_out = await run_binwalk_extraction(target_path, extraction_dir)
+        result.unpack_log = f"{log_prefix}{binwalk_out}"
     except TimeoutError as e:
         result.error = str(e)
-        result.unpack_log = str(e)
+        result.unpack_log = f"{log_prefix}{e}"
         return result
     except Exception as e:
         result.error = f"Extraction failed: {e}"
-        result.unpack_log = str(e)
+        result.unpack_log = f"{log_prefix}{e}"
         return result
 
     # Step 2: Find the filesystem root
     fs_root = find_filesystem_root(extraction_dir)
     if not fs_root:
         result.error = "Could not locate filesystem root in extracted contents"
+        try:
+            enc = await asyncio.to_thread(analyze_encryption, target_path)
+            diag = (
+                f"\n[firmwareguard] Entropy & Encryption Diagnosis:\n"
+                f"  Verdict:         {enc.verdict}\n"
+                f"  Overall Entropy: {enc.overall_entropy:.2f} bits/byte "
+                f"(high-entropy blocks: {int(enc.high_entropy_ratio * 100)}%)\n"
+                f"  Summary:         {enc.summary}\n"
+            )
+            result.unpack_log = f"{result.unpack_log}\n{diag}"
+        except Exception:
+            pass
         return result
     result.extracted_path = fs_root
 

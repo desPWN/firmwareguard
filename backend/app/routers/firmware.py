@@ -11,10 +11,19 @@ from app.database import async_session_factory, get_db
 from app.models.firmware import Firmware
 from app.models.project import Project
 from app.schemas.firmware import (
+    EntropyBlockResponse,
+    FirmwareDecryptRequest,
+    FirmwareDecryptResponse,
     FirmwareDetailResponse,
+    FirmwareEntropyResponse,
     FirmwareMetadataResponse,
     FirmwareUpdate,
     FirmwareUploadResponse,
+)
+from app.services.decryption_service import (
+    analyze_encryption,
+    auto_decrypt_if_known,
+    decrypt_custom,
 )
 from app.services.firmware_metadata_service import FirmwareMetadataService
 from app.services.firmware_service import FirmwareService, UploadSizeLimitError
@@ -132,11 +141,12 @@ async def _run_unpack_background(
     project_id: uuid.UUID,
     firmware_id: uuid.UUID,
     storage_path: str,
+    output_base: str | None = None,
 ) -> None:
     """Run firmware unpacking in the background with its own DB session."""
     try:
-        output_base = os.path.dirname(storage_path)
-        result = await unpack_firmware(storage_path, output_base)
+        resolved_base = output_base or os.path.dirname(storage_path)
+        result = await unpack_firmware(storage_path, resolved_base)
 
         async with async_session_factory() as db:
             try:
@@ -230,6 +240,119 @@ async def get_firmware_metadata(
         firmware.storage_path, firmware.id, db,
     )
     return metadata
+
+
+@router.get("/{firmware_id}/entropy", response_model=FirmwareEntropyResponse)
+async def get_firmware_entropy(
+    project_id: uuid.UUID,
+    firmware_id: uuid.UUID,
+    service: FirmwareService = Depends(get_firmware_service),
+):
+    """Analyze Shannon entropy, detect vendor encryption headers, and diagnose unpack failures."""
+    firmware = await service.get_by_id(firmware_id)
+    if not firmware or firmware.project_id != project_id:
+        raise HTTPException(404, "Firmware not found")
+    if not firmware.storage_path or not os.path.isfile(firmware.storage_path):
+        raise HTTPException(400, "Firmware file not available on disk")
+
+    analysis = await asyncio.to_thread(analyze_encryption, firmware.storage_path)
+    return FirmwareEntropyResponse(
+        file_size=analysis.file_size,
+        overall_entropy=analysis.overall_entropy,
+        min_entropy=analysis.min_entropy,
+        max_entropy=analysis.max_entropy,
+        high_entropy_ratio=analysis.high_entropy_ratio,
+        verdict=analysis.verdict,
+        detected_format=analysis.detected_format,
+        detected_format_label=analysis.detected_format_label,
+        known_signatures=analysis.known_signatures,
+        summary=analysis.summary,
+        blocks=[
+            EntropyBlockResponse(offset=b.offset, size=b.size, entropy=b.entropy)
+            for b in analysis.blocks
+        ],
+    )
+
+
+@router.post("/{firmware_id}/decrypt", response_model=FirmwareDecryptResponse)
+async def decrypt_firmware(
+    project_id: uuid.UUID,
+    firmware_id: uuid.UUID,
+    body: FirmwareDecryptRequest,
+    db: AsyncSession = Depends(get_db),
+    service: FirmwareService = Depends(get_firmware_service),
+):
+    """Decrypt a firmware image using a known vendor decryptor or custom key/IV, optionally unpacking it."""
+    proj_result = await db.execute(select(Project).where(Project.id == project_id))
+    project = proj_result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    firmware = await service.get_by_id(firmware_id)
+    if not firmware or firmware.project_id != project_id:
+        raise HTTPException(404, "Firmware not found")
+    if not firmware.storage_path or not os.path.isfile(firmware.storage_path):
+        raise HTTPException(400, "Firmware file not available on disk")
+
+    if project.status == "unpacking":
+        raise HTTPException(409, "Firmware is already being unpacked")
+
+    output_base = os.path.dirname(firmware.storage_path)
+    dec_dir = os.path.join(output_base, "decrypted")
+
+    try:
+        if body.mode == "auto":
+            dec_res = await asyncio.to_thread(auto_decrypt_if_known, firmware.storage_path, dec_dir)
+            if not dec_res:
+                raise HTTPException(
+                    400,
+                    "No built-in vendor decryptor matched this image header. Use custom key/IV mode.",
+                )
+        elif body.mode == "custom":
+            dec_res = await asyncio.to_thread(
+                decrypt_custom,
+                firmware.storage_path,
+                dec_dir,
+                algorithm=body.algorithm,
+                key=body.key,
+                key_format=body.key_format,
+                iv=body.iv,
+                offset=body.offset,
+                unpad=body.unpad,
+            )
+        else:
+            raise HTTPException(400, f"Invalid decryption mode: {body.mode}")
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        logger.exception("Firmware decryption failed for %s", firmware_id)
+        raise HTTPException(500, f"Decryption failed: {exc}")
+
+    unpack_started = False
+    if body.auto_unpack:
+        firmware.extracted_path = None
+        firmware.extraction_dir = None
+        firmware.unpack_log = f"[firmwareguard] {dec_res.message}\nStarting binwalk extraction...\n"
+        project.status = "unpacking"
+        await db.flush()
+        asyncio.create_task(
+            _run_unpack_background(
+                project_id, firmware_id, dec_res.output_path, output_base=output_base
+            )
+        )
+        unpack_started = True
+
+    return FirmwareDecryptResponse(
+        success=dec_res.success,
+        method=dec_res.method,
+        output_size=dec_res.output_size,
+        post_entropy=dec_res.post_entropy,
+        known_signatures=dec_res.known_signatures,
+        unpack_started=unpack_started,
+        message=dec_res.message,
+    )
 
 
 # ── Backward-compatible endpoints (no firmware_id in path) ──
